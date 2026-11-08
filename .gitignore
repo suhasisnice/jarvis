@@ -1,0 +1,10 @@
+.env
+*.env
+jarvis.log
+.venv/
+__pycache__/
+*.pyc
+*.onnx
+*.onnx.json
+*.db
+*.log

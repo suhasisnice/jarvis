@@ -1,0 +1,154 @@
+<title>Jarvis</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#05080d">
+<style>
+  :root { --bg:#05080d; --fg:#cfe8ff; --dim:#6f8aa3; --glow:#3fb6ff; --hot:#ff6b5a; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; min-height:100dvh; background:var(--bg); color:var(--fg);
+         font:16px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;
+         display:flex; flex-direction:column; align-items:center; padding:24px 16px; gap:20px; }
+  h1 { margin:0; font-size:13px; letter-spacing:.3em; color:var(--dim); font-weight:600; }
+  #orb { width:180px; height:180px; border-radius:50%; border:none; margin-top:4vh; cursor:pointer;
+         background:radial-gradient(circle at 50% 45%, #9fe0ff 0%, var(--glow) 30%, #0b3a5c 70%, #041320 100%);
+         box-shadow:0 0 40px #3fb6ff66, inset 0 0 30px #00000088; transition:transform .15s, box-shadow .15s;
+         touch-action:none; user-select:none; -webkit-user-select:none; }
+  #orb.rec  { transform:scale(1.08); box-shadow:0 0 70px var(--hot), inset 0 0 30px #00000088;
+              background:radial-gradient(circle at 50% 45%, #ffd2c8 0%, var(--hot) 35%, #5c1a12 75%, #200604 100%); }
+  #orb.busy { animation:pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 50% { box-shadow:0 0 90px #3fb6ffaa, inset 0 0 30px #00000088; } }
+  #hint { color:var(--dim); font-size:14px; min-height:1.4em; text-align:center; }
+  #log { width:100%; max-width:560px; display:flex; flex-direction:column; gap:10px; }
+  .you, .him { padding:10px 14px; border-radius:14px; max-width:88%; }
+  .you { align-self:flex-end; background:#12263a; }
+  .him { align-self:flex-start; background:#0b1724; border:1px solid #1d3a55; }
+  form { width:100%; max-width:560px; display:flex; gap:8px; margin-top:auto; }
+  input { flex:1; min-width:0; padding:12px 14px; border-radius:12px; border:1px solid #1d3a55;
+          background:#0b1724; color:var(--fg); font-size:16px; }
+  button.send { padding:0 16px; border-radius:12px; border:1px solid #1d3a55; background:#12263a; color:var(--fg); }
+  .warn { color:var(--hot); max-width:560px; text-align:center; }
+</style>
+
+<h1>J.A.R.V.I.S.</h1>
+<button id="orb" aria-label="Hold to talk"></button>
+<div id="hint">Hold the orb and speak. Release to send.</div>
+<div id="log" aria-live="polite"></div>
+<form id="type">
+  <input id="msg" placeholder="Or type to Jarvis" autocomplete="off">
+  <button class="send">Send</button>
+</form>
+
+<script>
+const orb = document.getElementById("orb"), hint = document.getElementById("hint"),
+      log = document.getElementById("log");
+const player = new Audio();
+let ctx, source, node, chunks = [], recording = false, busy = false, unlocked = false;
+
+function say(cls, text) {
+  const d = document.createElement("div"); d.className = cls; d.textContent = text;
+  log.appendChild(d); d.scrollIntoView({behavior: "smooth", block: "end"});
+}
+
+if (!window.isSecureContext || !navigator.mediaDevices) {
+  hint.innerHTML = '<span class="warn">Phones only allow the microphone over https. ' +
+    'Open this page through the tailscale https address. Typing below still works.</span>';
+  orb.disabled = true;
+}
+
+// iPhone only lets a page play sound it was "unlocked" for during a tap
+function unlock() {
+  if (unlocked) return; unlocked = true;
+  player.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+  player.play().catch(() => {});
+}
+
+async function start(e) {
+  e.preventDefault(); unlock();
+  if (busy || recording || orb.disabled) return;
+  try {
+    if (!ctx) {
+      const stream = await navigator.mediaDevices.getUserMedia(
+        {audio: {echoCancellation: true, noiseSuppression: true, channelCount: 1}});
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      source = ctx.createMediaStreamSource(stream);
+      node = ctx.createScriptProcessor(4096, 1, 1);
+      node.onaudioprocess = ev => { if (recording) chunks.push(new Float32Array(ev.inputBuffer.getChannelData(0))); };
+      source.connect(node); node.connect(ctx.destination);
+    }
+    await ctx.resume();
+    chunks = []; recording = true; orb.classList.add("rec"); hint.textContent = "Listening…";
+  } catch (err) {
+    hint.innerHTML = '<span class="warn">Microphone blocked: ' + err.message + '</span>';
+  }
+}
+
+async function stop(e) {
+  if (!recording) return;
+  e && e.preventDefault();
+  recording = false; orb.classList.remove("rec");
+  const pcm = merge(chunks);
+  if (pcm.length < ctx.sampleRate * 0.3) { hint.textContent = "Too short. Hold the orb while you speak."; return; }
+  send(wav(downsample(pcm, ctx.sampleRate, 16000), 16000));
+}
+
+function merge(parts) {
+  const out = new Float32Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; } return out;
+}
+
+function downsample(buf, from, to) {
+  if (from === to) return buf;
+  const ratio = from / to, out = new Float32Array(Math.floor(buf.length / ratio));
+  for (let i = 0; i < out.length; i++) {          // average each block: cheap low-pass
+    const s = Math.floor(i * ratio), e = Math.min(Math.floor((i + 1) * ratio), buf.length);
+    let sum = 0; for (let j = s; j < e; j++) sum += buf[j]; out[i] = sum / Math.max(1, e - s);
+  }
+  return out;
+}
+
+function wav(samples, rate) {
+  const b = new ArrayBuffer(44 + samples.length * 2), v = new DataView(b);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + samples.length * 2, true); str(8, "WAVE"); str(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true); str(36, "data"); v.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i])); v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([b], {type: "audio/wav"});
+}
+
+async function send(blob) {
+  busy = true; orb.classList.add("busy"); hint.textContent = "Thinking…";
+  try {
+    const r = await fetch("voice/turn", {method: "POST", headers: {"Content-Type": "audio/wav"}, body: blob});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.status);
+    if (j.transcript) say("you", j.transcript);
+    say("him", j.reply);
+    if (j.audio) { player.src = "data:audio/mpeg;base64," + j.audio; player.play().catch(() => {}); }
+    hint.textContent = "Hold the orb and speak.";
+  } catch (err) {
+    hint.innerHTML = '<span class="warn">Could not reach Jarvis: ' + err.message + '</span>';
+  } finally { busy = false; orb.classList.remove("busy"); }
+}
+
+document.getElementById("type").addEventListener("submit", async e => {
+  e.preventDefault(); unlock();
+  const box = document.getElementById("msg"), text = box.value.trim();
+  if (!text || busy) return;
+  box.value = ""; say("you", text); busy = true; orb.classList.add("busy");
+  try {
+    const r = await fetch("ask", {method: "POST", headers: {"Content-Type": "application/json"},
+                                  body: JSON.stringify({message: text})});
+    say("him", (await r.json()).reply || "No reply, sir.");
+  } catch (err) { say("him", "Could not reach Jarvis: " + err.message); }
+  finally { busy = false; orb.classList.remove("busy"); }
+});
+
+orb.addEventListener("pointerdown", start);
+orb.addEventListener("pointerup", stop);
+orb.addEventListener("pointercancel", stop);
+orb.addEventListener("pointerleave", stop);
+orb.addEventListener("contextmenu", e => e.preventDefault());
+</script>

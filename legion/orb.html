@@ -1,0 +1,164 @@
+<title>Jarvis Orb</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+  /* One dark look on purpose: the orb only reads on black. */
+  :root { --bg: #000; --fg: #b7c6d6; --dim: #44505e; color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg); overflow: hidden; box-sizing: border-box;
+    font: 13px/1.5 system-ui, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  canvas { width: min(86vmin, 440px); aspect-ratio: 1; max-width: 100%; }
+  #cap { min-height: 3em; max-width: 36ch; text-align: center; color: var(--dim); transition: color .3s; }
+  #cap.on { color: var(--fg); }
+  #mic { position: fixed; right: 14px; bottom: 14px; padding: 8px 14px; border-radius: 999px; cursor: pointer;
+         border: 1px solid var(--dim); background: transparent; color: var(--fg); font: inherit; }
+  #mic.off { border-color: #ff6b5a; color: #ff6b5a; }
+</style>
+<canvas id="orb" aria-label="Jarvis status orb"></canvas>
+<div id="cap" aria-live="polite"></div>
+<button id="mic" aria-pressed="false">Mic on</button>
+<script>
+const micBtn = document.getElementById('mic');
+function showMic(off) {
+  micBtn.textContent = off ? 'Mic off' : 'Mic on';
+  micBtn.classList.toggle('off', off); micBtn.setAttribute('aria-pressed', off);
+}
+micBtn.onclick = async () => {
+  try { showMic((await (await fetch('mic', { method: 'POST' })).json()).mic_muted); } catch {}
+};
+const cv = document.getElementById('orb'), x = cv.getContext('2d'), cap = document.getElementById('cap');
+let size = 0;
+function fit() {
+  const d = devicePixelRatio || 1;
+  size = cv.clientWidth;
+  cv.width = cv.height = Math.round(size * d);
+  x.setTransform(d, 0, 0, d, 0, 0);
+}
+addEventListener('resize', fit); fit();
+
+// Live state comes from ui.py at /state. If nothing answers (opened as a plain page), run a demo loop.
+const live = { state: 'idle', level: 0, text: '' };
+let demo = true;
+async function poll() {
+  try {
+    const r = await fetch('state', { cache: 'no-store' });
+    if (!r.ok) throw 0;
+    Object.assign(live, await r.json());
+    showMic(live.mic_muted);   // voice "mute my mic" updates the button too
+    demo = false;
+  } catch { demo = true; }
+  setTimeout(poll, demo ? 2000 : 50);
+}
+poll();
+
+function runDemo(t) {
+  const p = (t / 1000) % 13;
+  let s = 'idle', txt = '';
+  if (p >= 2 && p < 4.5) { s = 'listening'; txt = 'Listening…'; }
+  else if (p >= 4.5 && p < 7) { s = 'thinking'; txt = 'What’s on my calendar today?'; }
+  else if (p >= 7 && p < 11.5) { s = 'speaking'; txt = 'Two meetings, sir. The first is at ten, and I’d skip the second.'; }
+  live.state = s; live.text = txt;
+  // fake speech: syllable-like bursts with short pauses
+  const burst = Math.max(0, Math.sin(t / 70) * 0.45 + Math.sin(t / 23) * 0.25 + 0.35);
+  live.level = s === 'speaking' ? Math.min(1, burst) * (Math.sin(t / 400) > -0.6 ? 1 : 0.1) : 0;
+}
+
+// Look per state. hues = the five colour blobs, spin = turns per second, energy = glow + size.
+const LOOK = {
+  idle:      { hues: [190, 225, 290, 340, 385], spin: 0.12, energy: 0.25, rings: 2.5 },
+  listening: { hues: [185, 205, 230, 290, 340], spin: 0.25, energy: 0.6,  rings: 0.55 },
+  thinking:  { hues: [250, 275, 300, 215, 325], spin: 0.6,  energy: 0.8,  rings: 0 },
+  speaking:  { hues: [190, 225, 290, 340, 385], spin: 0.2,  energy: 0.55, rings: 0 },
+};
+const hues = [...LOOK.idle.hues];
+let angle = 0, energy = 0.25, level = 0, drift = 0, last = 0, ringClock = 0, peakCool = 0;
+const rings = [];
+const calm = matchMedia('(prefers-reduced-motion: reduce)').matches ? 0.3 : 1;
+
+function frame(t) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (t - last) / 1000 || 0); last = t;
+  if (demo) runDemo(t);
+  const L = LOOK[live.state] || LOOK.idle;
+
+  // ease toward the target look so state changes blend instead of jumping
+  const k = 1 - Math.pow(0.002, dt);
+  for (let i = 0; i < 5; i++) hues[i] += (L.hues[i] - hues[i]) * k;
+  level += ((live.level || 0) - level) * (1 - Math.pow(1e-6, dt));   // follows speech quickly
+  energy += (L.energy + level * 0.45 - energy) * k;
+  if (live.state === 'thinking') drift += dt * 140;                  // colours cycle while thinking
+  else drift += (Math.round(drift / 360) * 360 - drift) * k;         // then settle back
+
+  // spin: a base speed per state, plus voice loudness while speaking
+  const turns = L.spin + (live.state === 'speaking' ? level * 1.6 : 0);
+  angle += turns * Math.PI * 2 * dt * calm;
+
+  // ripple rings: on a timer when idle/listening, on loud syllables when speaking
+  ringClock += dt; peakCool -= dt;
+  if (L.rings && ringClock > L.rings) { ringClock = 0; rings.push({ r: 0, a: live.state === 'idle' ? 0.12 : 0.3 }); }
+  if (live.state === 'speaking' && level > 0.55 && peakCool <= 0) { peakCool = 0.18; rings.push({ r: 0, a: 0.25 * level }); }
+
+  draw(t, dt);
+  cap.textContent = live.text || '';
+  cap.className = live.state === 'idle' ? '' : 'on';
+}
+
+function draw(t, dt) {
+  const c = size / 2;
+  const R = size * 0.27 * (1 + level * 0.1 + (live.state === 'idle' ? Math.sin(t / 900) * 0.02 : 0));
+  x.clearRect(0, 0, size, size);
+
+  // outer glow
+  let g = x.createRadialGradient(c, c, R * 0.8, c, c, R * 1.6);
+  g.addColorStop(0, `hsl(${hues[0] + drift} 90% 60% / ${0.18 * energy})`);
+  g.addColorStop(1, 'hsl(0 0% 0% / 0)');
+  x.fillStyle = g; x.fillRect(0, 0, size, size);
+
+  // ripple rings
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const rg = rings[i];
+    rg.r += dt * 0.9;
+    if (rg.r >= 1) { rings.splice(i, 1); continue; }
+    x.beginPath(); x.arc(c, c, R * (1.05 + rg.r * 0.7), 0, Math.PI * 2);
+    x.strokeStyle = `rgba(255,255,255,${rg.a * (1 - rg.r)})`;
+    x.lineWidth = 2; x.stroke();
+  }
+
+  // sparkle around the rim, more when energetic
+  const n = Math.floor(energy * energy * 70);
+  x.fillStyle = 'rgba(255,255,255,0.5)';
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, d = R * (1.03 + Math.random() * 0.22);
+    x.fillRect(c + Math.cos(a) * d, c + Math.sin(a) * d, 1.2, 1.2);
+  }
+
+  // the orb: dark base + five colour blobs swirling in alternate directions, blended with 'screen'
+  x.save();
+  x.beginPath(); x.arc(c, c, R, 0, Math.PI * 2); x.clip();
+  x.fillStyle = `hsl(${hues[1] + drift} 70% 14%)`; x.fillRect(c - R, c - R, 2 * R, 2 * R);
+  x.globalCompositeOperation = 'screen';
+  for (let i = 0; i < 5; i++) {
+    const a = angle * (i % 2 ? 1 : -0.6) + i * 1.2566;
+    const d = R * (0.38 + 0.14 * Math.sin(t / 700 * (1 + i * 0.25) + i));
+    const bx = c + Math.cos(a) * d, by = c + Math.sin(a) * d, br = R * (0.8 + 0.15 * energy);
+    g = x.createRadialGradient(bx, by, 0, bx, by, br);
+    g.addColorStop(0, `hsl(${hues[i] + drift} 95% 58% / ${0.5 + 0.4 * energy})`);
+    g.addColorStop(1, `hsl(${hues[i] + drift} 95% 50% / 0)`);
+    x.fillStyle = g; x.fillRect(c - R, c - R, 2 * R, 2 * R);
+  }
+  x.globalCompositeOperation = 'source-over';
+  // glass look: soft highlight top-left + bright rim
+  g = x.createRadialGradient(c - R * 0.35, c - R * 0.45, 0, c - R * 0.35, c - R * 0.45, R * 0.75);
+  g.addColorStop(0, 'rgba(255,255,255,0.5)'); g.addColorStop(0.4, 'rgba(255,255,255,0.1)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+  x.fillStyle = g; x.fillRect(c - R, c - R, 2 * R, 2 * R);
+  g = x.createRadialGradient(c, c, R * 0.8, c, c, R);
+  g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(1, 'rgba(255,255,255,0.35)');
+  x.fillStyle = g; x.fillRect(c - R, c - R, 2 * R, 2 * R);
+  x.restore();
+}
+requestAnimationFrame(frame);
+</script>
